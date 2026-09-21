@@ -1,1 +1,1 @@
-Just some random python scripts that I'm sharing
+Just some random scripts that I'm sharing
