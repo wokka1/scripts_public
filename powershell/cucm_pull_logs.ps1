@@ -178,7 +178,18 @@ if (-not $CucmHost) { throw "CUCM_HOST is not set (env var or $EnvFile)." }
 if (-not $SoapUser) { throw "CUCM_SOAP_USER is not set (env var or $EnvFile)." }
 if (-not $SoapPass) { throw "CUCM_SOAP_PASSWORD / CUCM_SOAP_PASSWORD_ENC is not set (env var or $EnvFile)." }
 
-$ServiceUrl = "https://$($CucmHost):8443/logcollectionservice2/services/LogCollectionPortTypeService"
+function Get-CucmServiceUrl {
+    <# Each CUCM cluster node runs its own independent Log Collection
+    service against its own local filesystem - there's no cross-node
+    aggregation. selectLogFiles only ever searches whichever node's
+    Tomcat actually receives the request, confirmed live 2026-09-21 (the
+    response's own multi-<Node> schema shape misleadingly suggested
+    otherwise). So "pull from every node" means literally connecting to
+    every node's own hostname in turn, not one call to $CucmHost. #>
+    param([string]$TargetHost)
+    return "https://$($TargetHost):8443/logcollectionservice2/services/LogCollectionPortTypeService"
+}
+
 $ns = "http://schemas.cisco.com/ast/soap"
 
 $pair = "$($SoapUser):$($SoapPass)"
@@ -225,13 +236,15 @@ function Get-MimeParts {
 
 function Invoke-CucmSoap {
     param(
+        [string]$TargetHost,
         [string]$SoapAction,
         [string]$Body
     )
+    $serviceUrl = Get-CucmServiceUrl -TargetHost $TargetHost
     $headers = $authHeader.Clone()
     $headers["SOAPAction"] = "`"$SoapAction`""
 
-    Write-Debug "=== Request: $SoapAction ==="
+    Write-Debug "=== Request: $SoapAction ($TargetHost) ==="
     Write-Debug $Body
 
     # Invoke-WebRequest has its own built-in -Debug tracing (separate from
@@ -244,7 +257,7 @@ function Invoke-CucmSoap {
     $savedDebugPreference = $DebugPreference
     $DebugPreference = "SilentlyContinue"
     try {
-        $resp = Invoke-WebRequest -Uri $ServiceUrl -Method Post -Headers $headers `
+        $resp = Invoke-WebRequest -Uri $serviceUrl -Method Post -Headers $headers `
             -ContentType "text/xml; charset=utf-8" -Body $Body @skipCert
     } catch {
         $webResp = $_.Exception.Response
@@ -272,14 +285,15 @@ function Invoke-CucmSoap {
 }
 
 function Get-CucmTimeZoneString {
+    param([string]$TargetHost)
     $body = @"
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:log="$ns">
   <soapenv:Body>
-    <log:LocalHost>$CucmHost</log:LocalHost>
+    <log:LocalHost>$TargetHost</log:LocalHost>
   </soapenv:Body>
 </soapenv:Envelope>
 "@
-    $raw = Invoke-CucmSoap -SoapAction "getTimeZone" -Body $body
+    $raw = Invoke-CucmSoap -TargetHost $TargetHost -SoapAction "getTimeZone" -Body $body
     $xml = [xml]$raw
     $inner = [xml]$xml.Envelope.Body.TimeZone.'#text'
     return $inner.TimeZone.LocalTimeZone.value
@@ -287,11 +301,12 @@ function Get-CucmTimeZoneString {
 
 function Get-CucmClusterCatalog {
     <# Discovery call - listNodeServiceLogs with NO NodeName restriction.
-    Returns one object per node found: Node name + the real ServiceLog
-    names available there. Confirmed live: an empty <ListRequest></...>
-    still returns valid data (this lab cluster only has one node, so
-    multi-node behavior is inferred from the WSDL's unbounded return
-    type, not independently confirmed). #>
+    Unlike selectLogFiles (which only ever sees whichever node you're
+    connected to - see Get-CucmServiceUrl), this call genuinely returns
+    every node in the cluster regardless of which node you connect to -
+    confirmed live 2026-09-21 against a real multi-node prod cluster.
+    Only needs to be called once, against any single node. #>
+    param([string]$TargetHost)
     $body = @"
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:log="$ns">
   <soapenv:Body>
@@ -301,7 +316,7 @@ function Get-CucmClusterCatalog {
   </soapenv:Body>
 </soapenv:Envelope>
 "@
-    $raw = Invoke-CucmSoap -SoapAction "listNodeServiceLogs" -Body $body
+    $raw = Invoke-CucmSoap -TargetHost $TargetHost -SoapAction "listNodeServiceLogs" -Body $body
     $xml = [xml]$raw
     $ns_mgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
     $ns_mgr.AddNamespace("ns1", $ns)
@@ -316,17 +331,19 @@ function Get-CucmClusterCatalog {
 }
 
 function Get-CucmLogFileList {
-    <# selectLogFiles - no per-node request filter exists in this API;
-    CUCM always searches the whole cluster and groups results by node in
-    the response. Returns every matching file across every node, each
-    tagged with which node it actually came from - filter by NodeName
-    afterward if the wizard asked for a specific one. #>
+    <# selectLogFiles only ever searches $TargetHost's own node - see
+    Get-CucmServiceUrl's comment for why. Tags every result with
+    $TargetHost directly rather than trusting the response's own <Node>
+    <name> field, which is empty on some systems even for a genuine
+    match (confirmed on the lab box) - we already know which node we
+    asked, no need to trust CUCM to tell us back correctly. #>
     param(
+        [string]$TargetHost,
         [string]$ServiceName,
         [string]$RelText,
         [int]$RelTime
     )
-    $tz = Get-CucmTimeZoneString
+    $tz = Get-CucmTimeZoneString -TargetHost $TargetHost
 
     $body = @"
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:log="$ns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -356,31 +373,31 @@ function Get-CucmLogFileList {
   </soapenv:Body>
 </soapenv:Envelope>
 "@
-    $raw = Invoke-CucmSoap -SoapAction "selectLogFiles" -Body $body
+    $raw = Invoke-CucmSoap -TargetHost $TargetHost -SoapAction "selectLogFiles" -Body $body
     $xml = [xml]$raw
     $ns_mgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
     $ns_mgr.AddNamespace("ns1", $ns)
 
     $result = @()
-    $nodeNodes = $xml.SelectNodes("//ns1:SchemaFileSelectionResult/ns1:Node", $ns_mgr)
-    foreach ($node in $nodeNodes) {
-        $thisNodeName = $node.SelectSingleNode("ns1:name", $ns_mgr).InnerText
-        $files = $node.SelectNodes(".//ns1:File", $ns_mgr)
-        foreach ($f in $files) {
-            $result += [PSCustomObject]@{
-                NodeName     = $thisNodeName
-                Name         = $f.SelectSingleNode("ns1:name", $ns_mgr).InnerText
-                AbsolutePath = $f.SelectSingleNode("ns1:absolutepath", $ns_mgr).InnerText
-                SizeBytes    = $f.SelectSingleNode("ns1:filesize", $ns_mgr).InnerText
-                Modified     = $f.SelectSingleNode("ns1:modifiedDate", $ns_mgr).InnerText
-            }
+    $files = $xml.SelectNodes("//ns1:SchemaFileSelectionResult/ns1:Node//ns1:File", $ns_mgr)
+    foreach ($f in $files) {
+        $result += [PSCustomObject]@{
+            NodeName     = $TargetHost
+            Name         = $f.SelectSingleNode("ns1:name", $ns_mgr).InnerText
+            AbsolutePath = $f.SelectSingleNode("ns1:absolutepath", $ns_mgr).InnerText
+            SizeBytes    = $f.SelectSingleNode("ns1:filesize", $ns_mgr).InnerText
+            Modified     = $f.SelectSingleNode("ns1:modifiedDate", $ns_mgr).InnerText
         }
     }
     return , $result
 }
 
 function Get-CucmLogFileContent {
-    param([string]$AbsolutePath)
+    param(
+        [string]$TargetHost,
+        [string]$AbsolutePath
+    )
+    $serviceUrl = Get-CucmServiceUrl -TargetHost $TargetHost
 
     $body = @"
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:log="$ns">
@@ -391,12 +408,12 @@ function Get-CucmLogFileContent {
 "@
     $headers = $authHeader.Clone()
     $headers["SOAPAction"] = "`"GetOneFile`""
-    Write-Debug "=== Request: GetOneFile ($AbsolutePath) ==="
+    Write-Debug "=== Request: GetOneFile ($TargetHost, $AbsolutePath) ==="
     # Same credential-leak guard as Invoke-CucmSoap - see the comment there.
     $savedDebugPreference = $DebugPreference
     $DebugPreference = "SilentlyContinue"
     try {
-        $resp = Invoke-WebRequest -Uri $ServiceUrl -Method Post -Headers $headers `
+        $resp = Invoke-WebRequest -Uri $serviceUrl -Method Post -Headers $headers `
             -ContentType "text/xml; charset=utf-8" -Body $body @skipCert
     } finally {
         $DebugPreference = $savedDebugPreference
@@ -418,7 +435,7 @@ function Get-CucmLogFileContent {
 # ============ Interactive wizard (skipped for any param already supplied) ============
 
 Write-Host "Discovering services/nodes on $CucmHost ..."
-$catalog = Get-CucmClusterCatalog
+$catalog = Get-CucmClusterCatalog -TargetHost $CucmHost
 $allNodeNames = $catalog | ForEach-Object { $_.NodeName }
 $allServiceNames = $catalog | ForEach-Object { $_.Services } | Select-Object -Unique | Sort-Object
 
@@ -498,18 +515,26 @@ switch ($RangeMode) {
 }
 
 # --- main ---
+if (-not $PSBoundParameters.ContainsKey('OutputDir')) {
+    $OutputDir = "./logs-$(Get-Date -Format 'yyyyMMdd-HHmm')"
+}
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-Write-Debug "Query parameters: ServiceName='$ServiceName' NodeName='$NodeName' RelText='$RelText' RelTime=$RelTime"
-Write-Host "`nQuerying $ServiceName logs, last $RelTime $RelText ..."
-$files = Get-CucmLogFileList -ServiceName $ServiceName -RelText $RelText -RelTime $RelTime
+$targetNodes = if ($NodeName) { , @($NodeName) } else { $allNodeNames }
+Write-Debug "Query parameters: ServiceName='$ServiceName' Nodes=$($targetNodes -join ', ') RelText='$RelText' RelTime=$RelTime"
+Write-Host "`nQuerying $ServiceName logs, last $RelTime $RelText, across $($targetNodes.Count) node(s): $($targetNodes -join ', ') ..."
 
-if ($NodeName) {
-    $blankNodeCount = ($files | Where-Object { [string]::IsNullOrWhiteSpace($_.NodeName) }).Count
-    if ($blankNodeCount -gt 0) {
-        Write-Warning "$blankNodeCount of $($files.Count) file(s) came back with NO node name from CUCM (confirmed happens on some systems - see script notes). Filtering to '$NodeName' will silently drop those - if you get 0 results below, this is almost certainly why, not a real 'wrong node' answer."
+# selectLogFiles only ever sees the node it's connected to (see
+# Get-CucmServiceUrl) - "all nodes" means a separate call per node, not
+# one call that happens to cover everything.
+$files = @()
+foreach ($node in $targetNodes) {
+    Write-Host "  querying $node ..."
+    try {
+        $files += Get-CucmLogFileList -TargetHost $node -ServiceName $ServiceName -RelText $RelText -RelTime $RelTime
+    } catch {
+        Write-Warning "  Failed to query $node - $($_.Exception.Message)"
     }
-    $files = $files | Where-Object { $_.NodeName -eq $NodeName }
 }
 
 if (-not $files -or $files.Count -eq 0) {
@@ -552,7 +577,7 @@ if ($confirm -notmatch '^[Yy]') {
 foreach ($f in $files) {
     Write-Host "`nFetching $($f.Name) from $($f.NodeName) ..."
     try {
-        $content = Get-CucmLogFileContent -AbsolutePath $f.AbsolutePath
+        $content = Get-CucmLogFileContent -TargetHost $f.NodeName -AbsolutePath $f.AbsolutePath
         $nodeDir = Join-Path $OutputDir $f.NodeName
         New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
         $outPath = Join-Path $nodeDir $f.Name
