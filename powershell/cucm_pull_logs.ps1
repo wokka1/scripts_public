@@ -57,6 +57,20 @@
         return by default - the unary comma (`return , $x`) is used
         throughout to prevent that; a real bug hit building the first
         version of this script.
+      - GetOneFile's response carries a genuine binary attachment
+        (the gzipped log file itself). Decoding the raw HTTP response
+        bytes as UTF-8 text is LOSSY for binary data - any byte that
+        isn't valid standalone UTF-8 (common throughout compressed
+        data, e.g. gzip's own 0x8B magic byte) gets silently replaced
+        with U+FFFD, permanently destroying it. Confirmed real 2026-09-25
+        against a real corrupted pull: every attachment came out
+        BOM-prefixed and unrecoverably damaged. Fixed by using Latin-1
+        (ISO-8859-1) instead of UTF-8 for the byte<->string round-trip -
+        Latin-1 maps all 256 byte values 1:1 with zero loss, so the
+        existing regex-based MIME splitting keeps working unchanged,
+        and the final save now writes raw bytes directly instead of
+        going through Set-Content's own encoding (which also added the
+        observed BOM). Never swap this back to UTF-8.
 
 .NOTES
     Required settings (env vars, or a .env file - see -EnvFile below):
@@ -213,6 +227,19 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Lossless byte<->string codec, used ANYWHERE a raw HTTP response might
+# carry binary data (every Log Collection response is a MIME/XOP envelope,
+# and GetOneFile's carries a real binary attachment). UTF-8 is lossy for
+# arbitrary binary - any byte that isn't valid standalone UTF-8 gets
+# silently replaced with U+FFFD, permanently destroying it (confirmed
+# real 2026-09-25: every GetOneFile pull came out BOM-prefixed and
+# unrecoverably corrupted before this fix). Latin-1 (ISO-8859-1) maps all
+# 256 byte values 1:1 with zero loss, so the existing regex-based MIME
+# splitting below still works unchanged, and the bytes can be perfectly
+# reconstructed afterward with GetBytes() on the same encoding. Never use
+# UTF8/[System.Text.Encoding]::UTF8 for this round-trip.
+$binarySafeEncoding = [System.Text.Encoding]::GetEncoding(28591)
+
 function Get-MimeParts {
     param([string]$Raw)
     $boundaryMatch = [regex]::Match($Raw, '--(MIMEBoundary\S+)')
@@ -274,7 +301,7 @@ function Invoke-CucmSoap {
     }
 
     if ($resp.Content -is [byte[]]) {
-        $raw = [System.Text.Encoding]::UTF8.GetString($resp.Content)
+        $raw = $binarySafeEncoding.GetString($resp.Content)
     } else {
         $raw = $resp.Content
     }
@@ -419,7 +446,7 @@ function Get-CucmLogFileContent {
         $DebugPreference = $savedDebugPreference
     }
     if ($resp.Content -is [byte[]]) {
-        $raw = [System.Text.Encoding]::UTF8.GetString($resp.Content)
+        $raw = $binarySafeEncoding.GetString($resp.Content)
     } else {
         $raw = $resp.Content
     }
@@ -430,6 +457,66 @@ function Get-CucmLogFileContent {
         return $parts[0]
     }
     return $parts[1]
+}
+
+function Invoke-CucmNodeDownload {
+    <# Fetches every file for one node, sequentially, from within its own
+    runspace - one of these runs concurrently per node (see the
+    RunspacePool setup below). Deliberately self-contained: a runspace
+    doesn't inherit the caller's function/variable scope, so everything
+    it needs (GetOneFile call, MIME split, binary-safe save) is
+    reimplemented here rather than calling back into the main script's
+    Get-CucmLogFileContent/Get-MimeParts. Runspaces DO share the same
+    process as the caller (unlike Start-Job, which spawns a whole
+    separate PowerShell.exe), so the self-signed-cert trust already set
+    up once via ServicePointManager in the main script body applies here
+    too - no need to redo that per node. #>
+    param($TargetHost, $NodeFiles, $AuthHeader, $SkipCert, $NodeDir, $BinaryEncoding)
+
+    function Get-MimePartsLocal {
+        param([string]$Raw)
+        $boundaryMatch = [regex]::Match($Raw, '--(MIMEBoundary\S+)')
+        if (-not $boundaryMatch.Success) { return , @($Raw) }
+        $boundary = $boundaryMatch.Groups[1].Value
+        $rawParts = $Raw -split [regex]::Escape("--$boundary")
+        $bodies = @()
+        foreach ($p in $rawParts) {
+            if ($p.Trim().Length -eq 0 -or $p.Trim() -eq "--") { continue }
+            $split = $p -split "`r`n`r`n", 2
+            if ($split.Count -eq 2) { $bodies += $split[1] } else { $bodies += $p }
+        }
+        return , $bodies
+    }
+
+    $serviceUrl = "https://$($TargetHost):8443/logcollectionservice2/services/LogCollectionPortTypeService"
+    $results = @()
+
+    foreach ($f in $NodeFiles) {
+        try {
+            $body = @"
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:log="http://schemas.cisco.com/ast/soap">
+  <soapenv:Body>
+    <log:FileName>$($f.AbsolutePath)</log:FileName>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+            $headers = $AuthHeader.Clone()
+            $headers["SOAPAction"] = '"GetOneFile"'
+            $resp = Invoke-WebRequest -Uri $serviceUrl -Method Post -Headers $headers `
+                -ContentType "text/xml; charset=utf-8" -Body $body @SkipCert
+
+            $raw = if ($resp.Content -is [byte[]]) { $BinaryEncoding.GetString($resp.Content) } else { $resp.Content }
+            $parts = Get-MimePartsLocal -Raw $raw
+            $content = if ($parts.Count -ge 2) { $parts[1] } else { $parts[0] }
+
+            $outPath = Join-Path $NodeDir $f.Name
+            [System.IO.File]::WriteAllBytes($outPath, $BinaryEncoding.GetBytes($content))
+            $results += "OK: $($f.Name)"
+        } catch {
+            $results += "FAIL: $($f.Name) - $($_.Exception.Message)"
+        }
+    }
+    return , $results
 }
 
 # ============ Interactive wizard (skipped for any param already supplied) ============
@@ -574,16 +661,52 @@ if ($confirm -notmatch '^[Yy]') {
     return
 }
 
-foreach ($f in $files) {
-    Write-Host "`nFetching $($f.Name) from $($f.NodeName) ..."
-    try {
-        $content = Get-CucmLogFileContent -TargetHost $f.NodeName -AbsolutePath $f.AbsolutePath
-        $nodeDir = Join-Path $OutputDir $f.NodeName
-        New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
-        $outPath = Join-Path $nodeDir $f.Name
-        Set-Content -Path $outPath -Value $content -Encoding UTF8 -NoNewline
-        Write-Host "  -> saved to $outPath"
-    } catch {
-        Write-Warning "  Failed to fetch $($f.Name) - $($_.Exception.Message)"
-    }
+# One concurrent stream per node - each node's Log Collection service is
+# independent, so this is safe to parallelize across nodes. Files within
+# a single node are still fetched sequentially (one runspace per node,
+# not per file) - deliberate, since hammering one node's Tomcat with many
+# concurrent GetOneFile calls is more likely to cause problems than help.
+$filesByNode = $files | Group-Object NodeName
+
+# Runspaces in the pool don't inherit function definitions from this
+# script's scope automatically (only variables/state can be shared, and
+# only if explicitly passed) - share Invoke-CucmNodeDownload explicitly
+# via InitialSessionState so AddCommand("Invoke-CucmNodeDownload") below
+# actually resolves inside each runspace. Has to be built BEFORE creating
+# the pool and passed into the constructor - the plain
+# CreateRunspacePool(min, max) overload leaves .InitialSessionState null,
+# it's not something you can populate after the fact.
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$funcEntry = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry(
+    "Invoke-CucmNodeDownload", ${function:Invoke-CucmNodeDownload})
+$iss.Commands.Add($funcEntry)
+
+$pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Max(1, $filesByNode.Count), $iss, $Host)
+$pool.Open()
+
+Write-Host "`nDownloading from $($filesByNode.Count) node(s) in parallel, one stream per node ..."
+$running = @()
+foreach ($group in $filesByNode) {
+    $nodeDir = Join-Path $OutputDir $group.Name
+    New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddCommand("Invoke-CucmNodeDownload").
+        AddParameter("TargetHost", $group.Name).
+        AddParameter("NodeFiles", $group.Group).
+        AddParameter("AuthHeader", $authHeader).
+        AddParameter("SkipCert", $skipCert).
+        AddParameter("NodeDir", $nodeDir).
+        AddParameter("BinaryEncoding", $binarySafeEncoding)
+    $running += [PSCustomObject]@{ Node = $group.Name; Pipe = $ps; Handle = $ps.BeginInvoke() }
 }
+
+foreach ($r in $running) {
+    $out = $r.Pipe.EndInvoke($r.Handle)
+    Write-Host "`n--- $($r.Node) ---"
+    $out | ForEach-Object { Write-Host "  $_" }
+    $r.Pipe.Dispose()
+}
+$pool.Close()
+$pool.Dispose()
