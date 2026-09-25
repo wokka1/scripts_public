@@ -607,6 +607,29 @@ if (-not $PSBoundParameters.ContainsKey('OutputDir')) {
 }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
+# Resolve to an absolute path NOW, before any runspace touches it. A
+# runspace created via [powershell]::Create() doesn't reliably inherit
+# this script's working directory - a relative path handed to a runspace
+# and then passed to [System.IO.File]::WriteAllBytes() can resolve
+# against a completely different directory (confirmed real 2026-09-25:
+# landed in C:\WINDOWS\system32 instead of the script's own folder).
+# Every $nodeDir/$outPath built from $OutputDir downstream needs to
+# already be absolute so this can't happen regardless of which runspace
+# handles it.
+#
+# IMPORTANT: use PowerShell's own path resolution here, NOT
+# [System.IO.Path]::GetFullPath() - that resolves against .NET's
+# [Environment]::CurrentDirectory, which is a SEPARATE notion of
+# "current directory" from PowerShell's own $PWD and can silently
+# diverge from it (confirmed real 2026-09-25: a session whose prompt
+# showed C:\Users\...\apps still had Environment.CurrentDirectory stuck
+# at C:\WINDOWS\system32 - GetFullPath() used the wrong one, made this
+# worse instead of better on the first attempt at this fix).
+# GetUnresolvedProviderPathFromPSPath resolves against PowerShell's
+# actual current location - whatever the prompt shows - immune to that
+# divergence.
+$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+
 $targetNodes = if ($NodeName) { , @($NodeName) } else { $allNodeNames }
 Write-Debug "Query parameters: ServiceName='$ServiceName' Nodes=$($targetNodes -join ', ') RelText='$RelText' RelTime=$RelTime"
 Write-Host "`nQuerying $ServiceName logs, last $RelTime $RelText, across $($targetNodes.Count) node(s): $($targetNodes -join ', ') ..."
